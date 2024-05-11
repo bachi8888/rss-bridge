@@ -1,202 +1,280 @@
 <?php
-class TwitchBridge extends BridgeAbstract {
 
-	const MAINTAINER = 'Roliga';
-	const NAME = 'Twitch Bridge';
-	const URI = 'https://twitch.tv/';
-	const CACHE_TIMEOUT = 300; // 5min
-	const DESCRIPTION = 'Twitch channel videos';
-	const PARAMETERS = array( array(
-		'channel' => array(
-			'name' => 'Channel',
-			'type' => 'text',
-			'required' => true,
-			'title' => 'Lowercase channel name as seen in channel URL'
-		),
-		'type' => array(
-			'name' => 'Type',
-			'type' => 'list',
-			'values' => array(
-				'All' => 'all',
-				'Archive' => 'archive',
-				'Highlights' => 'highlight',
-				'Uploads' => 'upload'
-			),
-			'defaultValue' => 'archive'
-		)
-	));
+class TwitchBridge extends BridgeAbstract
+{
+    const MAINTAINER = 'Roliga';
+    const NAME = 'Twitch Bridge';
+    const URI = 'https://twitch.tv/';
+    const CACHE_TIMEOUT = 300; // 5min
+    const DESCRIPTION = 'Twitch channel videos';
+    const PARAMETERS = [ [
+        'channel' => [
+            'name' => 'Channel',
+            'type' => 'text',
+            'required' => true,
+            'exampleValue' => 'criticalrole',
+            'title' => 'Lowercase channel name as seen in channel URL'
+        ],
+        'type' => [
+            'name' => 'Type',
+            'type' => 'list',
+            'values' => [
+                'All' => 'all',
+                'Archive' => 'archive',
+                'Highlights' => 'highlight',
+                'Uploads' => 'upload',
+                'Past Premieres' => 'past_premiere',
+                'Premiere Uploads' => 'premiere_upload'
+            ],
+            'defaultValue' => 'archive'
+        ]
+    ]];
 
-	/*
-	 * Official instructions for obtaining your own client ID can be found here:
-	 * https://dev.twitch.tv/docs/v5/#getting-a-client-id
-	 */
-	const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+    const BROADCAST_TYPES = [
+        'all' => [
+            'ARCHIVE',
+            'HIGHLIGHT',
+            'UPLOAD',
+            'PAST_PREMIERE',
+            'PREMIERE_UPLOAD'
+        ],
+        'archive' => 'ARCHIVE',
+        'highlight' => 'HIGHLIGHT',
+        'upload' => 'UPLOAD',
+        'past_premiere' => 'PAST_PREMIERE',
+        'premiere_upload' => 'PREMIERE_UPLOAD'
+    ];
 
-	public function collectData(){
-		// get channel user
-		$query_data = array(
-			'login' => $this->getInput('channel')
-		);
-		$users = $this->apiGet('users', $query_data)->users;
-		if(count($users) === 0)
-			returnClientError('User "'
-			. $this->getInput('channel')
-			. '" could not be found');
-		$user = $users[0];
+    public function collectData()
+    {
+        $query = <<<'EOD'
+query VODList($channel: String!, $types: [BroadcastType!]) {
+  user(login: $channel) {
+    displayName
+    videos(types: $types, sort: TIME) {
+      edges {
+        node {
+          id
+          title
+          publishedAt
+          lengthSeconds
+          viewCount
+          thumbnailURLs(width: 640, height: 360)
+          previewThumbnailURL(width: 640, height: 360)
+          description
+          tags
+          contentTags {
+            isLanguageTag
+            localizedName
+          }
+          game {
+            displayName
+          }
+          moments(momentRequestType: VIDEO_CHAPTER_MARKERS) {
+            edges {
+              node {
+                description
+                positionMilliseconds
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+EOD;
+        $channel = $this->getInput('channel');
+        $type = $this->getInput('type');
+        $variables = [
+            'channel' => $channel,
+            'types' => self::BROADCAST_TYPES[$type]
+        ];
+        $response = $this->apiRequest($query, $variables);
+        $data = $response->data;
+        if ($data->user === null) {
+            throw new \Exception(sprintf('Unable to find channel `%s`', $channel));
+        }
 
-		// get video list
-		$query_endpoint = 'channels/' . $user->_id . '/videos';
-		$query_data = array(
-			'broadcast_type' => $this->getInput('type'),
-			'limit' => 10
-		);
-		$videos = $this->apiGet($query_endpoint, $query_data)->videos;
+        $user = $data->user;
+        if ($user->videos === null) {
+            // twitch regularly does this for unknown reasons
+            //$this->logger->info('Twitch returned empty set of videos', ['data' => $data]);
+            return;
+        }
 
-		foreach($videos as $video) {
-			$item = array(
-				'uri' => $video->url,
-				'title' => $video->title,
-				'timestamp' => $video->published_at,
-				'author' => $video->channel->display_name,
-			);
+        foreach ($user->videos->edges as $edge) {
+            $video = $edge->node;
 
-			// Add categories for tags and played game
-			$item['categories'] = array_filter(explode(' ', $video->tag_list));
-			if(!empty($video->game))
-				$item['categories'][] = $video->game;
+            $url = 'https://www.twitch.tv/videos/' . $video->id;
 
-			// Add enclosures for thumbnails from a few points in the video
-			$item['enclosures'] = array();
-			foreach($video->thumbnails->large as $thumbnail)
-				$item['enclosures'][] = $thumbnail->url;
+            $item = [
+                'uri' => $url,
+                'title' => $video->title,
+                'timestamp' => $video->publishedAt,
+                'author' => $user->displayName,
+            ];
 
-			/*
-			 * Content format example:
-			 *
-			 * [Preview Image]
-			 *
-			 * Some optional video description.
-			 *
-			 * Duration: 1:23:45
-			 * Views: 123
-			 *
-			 * Played games:
-			 * * 00:00:00 Game 1
-			 * * 00:12:34 Game 2
-			 *
-			 */
-			$item['content'] = '<p><a href="'
-				. $video->url
-				. '"><img src="'
-				. $video->preview->large
-				. '" /></a></p><p>'
-				. $video->description_html
-				. '</p><p><b>Duration:</b> '
-				. $this->formatTimestampTime($video->length)
-				. '<br/><b>Views:</b> '
-				. $video->views
-				. '</p>';
+            // Add categories for tags and played game
+            $item['categories'] = $video->tags;
+            if (!is_null($video->game)) {
+                $item['categories'][] = $video->game->displayName;
+            }
 
-			// Add played games list to content
-			$video_id = trim($video->_id, 'v'); // _id gives 'v1234' but API wants '1234'
-			$markers = $this->apiGet('videos/' . $video_id . '/markers')->markers;
-			$item['content'] .= '<p><b>Played games:</b></b><ul><li><a href="'
-				. $video->url
-				. '">00:00:00</a> - '
-				. $video->game
-				. '</li>';
-			if(isset($markers->game_changes)) {
-				usort($markers->game_changes, function($a, $b) {
-					return $a->time - $b->time;
-				});
-				foreach($markers->game_changes as $game_change) {
-					$item['categories'][] = $game_change->label;
-					$item['content'] .= '<li><a href="'
-						. $video->url
-						. '?t='
-						. $this->formatQueryTime($game_change->time)
-						. '">'
-						. $this->formatTimestampTime($game_change->time)
-						. '</a> - '
-						. $game_change->label
-						. '</li>';
-				}
-			}
-			$item['content'] .= '</ul></p>';
+            $contentTags = $video->contentTags ?? [];
+            foreach ($contentTags as $tag) {
+                if (!$tag->isLanguageTag) {
+                    $item['categories'][] = $tag->localizedName;
+                }
+            }
 
-			$this->items[] = $item;
-		}
-	}
+            // Add enclosures for thumbnails from a few points in the video
+            // Thumbnail list has duplicate entries sometimes so remove those
+            $item['enclosures'] = array_unique($video->thumbnailURLs);
 
-	// e.g. 01:53:27
-	private function formatTimestampTime($seconds) {
-		return sprintf('%02d:%02d:%02d',
-			floor($seconds / 3600),
-			($seconds / 60) % 60,
-			$seconds % 60);
-	}
+            /*
+             * Content format example:
+             *
+             * [Preview Image]
+             *
+             * Some optional video description.
+             *
+             * Duration: 1:23:45
+             * Views: 123
+             *
+             * Played games:
+             * * 00:00:00 Game 1
+             * * 00:12:34 Game 2
+             *
+             */
+            $item['content'] = '<p><a href="'
+                . $url
+                . '"><img src="'
+                . $video->previewThumbnailURL
+                . '" /></a></p><p>'
+                . $video->description // in markdown format
+                . '</p><p><b>Duration:</b> '
+                . $this->formatTimestampTime($video->lengthSeconds)
+                . '<br/><b>Views:</b> '
+                . $video->viewCount
+                . '</p>';
 
-	// e.g. 01h53m27s
-	private function formatQueryTime($seconds) {
-		return sprintf('%02dh%02dm%02ds',
-			floor($seconds / 3600),
-			($seconds / 60) % 60,
-			$seconds % 60);
-	}
+            // Add played games list to content
+            $item['content'] .= '<p><b>Played games:</b><ul>';
 
-	/*
-	 * Ideally the new 'helix' API should be used as v5/'kraken' is deprecated.
-	 * The new API however still misses many features (markers, played game..) of
-	 * the old one, so let's use the old one for as long as it's available.
-	 */
-	private function apiGet($endpoint, $query_data = array()) {
-		$query_data['api_version'] = 5;
-		$url = 'https://api.twitch.tv/kraken/'
-			. $endpoint
-			. '?'
-			. http_build_query($query_data);
-		$header = array(
-			'Client-ID: ' . self::CLIENT_ID
-		);
+            $momentEdges = $video->moments->edges ?? [];
+            if (count($momentEdges) > 0) {
+                foreach ($momentEdges as $momentEdge) {
+                    $moment = $momentEdge->node;
 
-		$data = json_decode(getContents($url, $header))
-			or returnServerError('API request to "' . $url . '" failed.');
+                    $item['categories'][] = $moment->description;
+                    $item['content'] .= '<li><a href="'
+                        . $url
+                        . '?t='
+                        . $this->formatQueryTime($moment->positionMilliseconds / 1000)
+                        . '">'
+                        . $this->formatTimestampTime($moment->positionMilliseconds / 1000)
+                        . '</a> - '
+                        . $moment->description
+                        . '</li>';
+                }
+            } else {
+                $item['content'] .= '<li><a href="'
+                    . $url
+                    . '">00:00:00</a> - '
+                    . ($video->game ? $video->game->displayName : 'No Game')
+                    . '</li>';
+            }
+            $item['content'] .= '</ul></p>';
 
-		return $data;
-	}
+            $item['categories'] = array_unique($item['categories']);
 
-	public function getName(){
-		if(!is_null($this->getInput('channel'))) {
-			return $this->getInput('channel') . ' twitch videos';
-		}
+            $this->items[] = $item;
+        }
+    }
 
-		return parent::getName();
-	}
+    // e.g. 01:53:27
+    private function formatTimestampTime($seconds)
+    {
+        return sprintf(
+            '%02d:%02d:%02d',
+            floor($seconds / 3600),
+            ($seconds / 60) % 60,
+            $seconds % 60
+        );
+    }
 
-	public function getURI(){
-		if(!is_null($this->getInput('channel'))) {
-			return self::URI . $this->getInput('channel');
-		}
+    // e.g. 01h53m27s
+    private function formatQueryTime($seconds)
+    {
+        return sprintf(
+            '%02dh%02dm%02ds',
+            floor($seconds / 3600),
+            ($seconds / 60) % 60,
+            $seconds % 60
+        );
+    }
 
-		return parent::getURI();
-	}
+    /**
+     * GraphQL: https://graphql.org/
+     * Tool for developing/testing queries: https://github.com/skevy/graphiql-app
+     *
+     * Official instructions for obtaining your own client ID can be found here:
+     * https://dev.twitch.tv/docs/v5/#getting-a-client-id
+     */
+    private function apiRequest($query, $variables)
+    {
+        $request = [
+            'query'     => $query,
+            'variables' => $variables,
+        ];
+        $headers = [
+            'Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko',
+        ];
+        $opts = [
+            CURLOPT_CUSTOMREQUEST => 'POST',
+            CURLOPT_POSTFIELDS => json_encode($request),
+        ];
+        $json = getContents('https://gql.twitch.tv/gql', $headers, $opts);
+        $result = Json::decode($json, false);
+        return $result;
+    }
 
-	public function detectParameters($url){
-		$params = array();
+    public function getName()
+    {
+        if (!is_null($this->getInput('channel'))) {
+            return $this->getInput('channel') . ' twitch videos';
+        }
 
-		// Matches e.g. https://www.twitch.tv/someuser/videos?filter=archives
-		$regex = '/^(https?:\/\/)?
+        return parent::getName();
+    }
+
+    public function getURI()
+    {
+        if (!is_null($this->getInput('channel'))) {
+            return self::URI . $this->getInput('channel');
+        }
+
+        return parent::getURI();
+    }
+
+    public function detectParameters($url)
+    {
+        $params = [];
+
+        // Matches e.g. https://www.twitch.tv/someuser/videos?filter=archives
+        $regex = '/^(https?:\/\/)?
 			(www\.)?
 			twitch\.tv\/
 			([^\/&?\n]+)
 			\/videos\?.*filter=
 			(all|archive|highlight|upload)/x';
-		if(preg_match($regex, $url, $matches) > 0) {
-			$params['channel'] = urldecode($matches[3]);
-			$params['type'] = $matches[4];
-			return $params;
-		}
+        if (preg_match($regex, $url, $matches) > 0) {
+            $params['channel'] = urldecode($matches[3]);
+            $params['type'] = $matches[4];
+            return $params;
+        }
 
-		return null;
-	}
+        return null;
+    }
 }

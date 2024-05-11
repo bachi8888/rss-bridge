@@ -1,72 +1,352 @@
 <?php
-class PixivBridge extends BridgeAbstract {
 
-	const MAINTAINER = 'teromene';
-	const NAME = 'Pixiv Bridge';
-	const URI = 'https://www.pixiv.net/';
-	const DESCRIPTION = 'Returns the tag search from pixiv.net';
+/**
+ * Good resource on API return values (Ex: illustType):
+ * https://hackage.haskell.org/package/pixiv-0.1.0/docs/Web-Pixiv-Types.html
+ */
+class PixivBridge extends BridgeAbstract
+{
+    const NAME = 'Pixiv Bridge';
+    const URI = 'https://www.pixiv.net/';
+    const DESCRIPTION = 'Returns the tag search from pixiv.net';
+    const MAINTAINER = 'mruac';
+    const CONFIGURATION = [
+        'cookie' => [
+            'required' => false,
+            'defaultValue' => null
+        ],
+        'proxy_url' => [
+            'required' => false,
+            'defaultValue' => null
+        ]
+    ];
 
+    const PARAMETERS = [
+        'global' => [
+            'posts' => [
+                'name' => 'Post Limit',
+                'type' => 'number',
+                'defaultValue' => '10'
+            ],
+            'fullsize' => [
+                'name' => 'Full-size Image',
+                'type' => 'checkbox'
+            ],
+            'mode' => [
+                'name' => 'Post Type',
+                'type' => 'list',
+                'values' => [
+                    'All Works' => 'all',
+                    'Illustrations' => 'illustrations/',
+                    'Manga' => 'manga/',
+                    'Novels' => 'novels/'
+                ]
+            ],
+            'mature' => [
+                'name' => 'Include R-18 works',
+                'type' => 'checkbox'
+            ],
+            'ai' => [
+                'name' => 'Include AI-Generated works',
+                'type' => 'checkbox'
+            ]
+        ],
+        'Tag' => [
+            'tag' => [
+                'name' => 'Query to search',
+                'exampleValue' => 'オリジナル',
+                'required' => true
+            ]
+        ],
+        'User' => [
+            'userid' => [
+                'name' => 'User ID from profile URL',
+                'exampleValue' => '11',
+                'required' => true
+            ]
+        ]
+    ];
 
-	const PARAMETERS = array( array(
-		'tag' => array(
-			'name' => 'Tag to search',
-			'exampleValue' => 'example',
-			'required' => true
-		),
-	));
+    // maps from URLs to json keys by context
+    const JSON_KEY_MAP = [
+        'Tag' => [
+            'illustrations/' => 'illust',
+            'manga/' => 'manga',
+            'novels/' => 'novel'
+        ],
+        'User' => [
+            'illustrations/' => 'illusts',
+            'manga/' => 'manga',
+            'novels/' => 'novels'
+        ]
+    ];
 
-	public function collectData(){
+    // Hold the username for getName()
+    private $username = null;
 
-		$html = getContents(static::URI . 'search.php?word=' . urlencode($this->getInput('tag')))
-			or returnClientError('Unable to query pixiv.net');
-		$regex = '/<input type="hidden"id="js-mount-point-search-result-list"data-items="([^"]*)/';
-		$timeRegex = '/img\/([0-9]{4})\/([0-9]{2})\/([0-9]{2})\/([0-9]{2})\/([0-9]{2})\/([0-9]{2})\//';
+    public function getName()
+    {
+        switch ($this->queriedContext) {
+            case 'Tag':
+                $context = 'Tag';
+                $query = $this->getInput('tag');
+                break;
+            case 'User':
+                $context = 'User';
+                $query = $this->username ?? $this->getInput('userid');
+                break;
+            default:
+                return parent::getName();
+        }
+        return 'Pixiv ' . $this->getKey('mode') . " from {$context} {$query}";
+    }
 
-		preg_match_all($regex, $html, $matches, PREG_SET_ORDER, 0);
-		if(!$matches) return;
+    public function getURI()
+    {
+        switch ($this->queriedContext) {
+            case 'Tag':
+                $uri = static::URI . 'tags/' . urlencode($this->getInput('tag') ?? '');
+                break;
+            case 'User':
+                $uri = static::URI . 'users/' . $this->getInput('userid');
+                break;
+            default:
+                return parent::getURI();
+        }
+        if ($this->getInput('mode') != 'all') {
+            $uri = $uri . '/' . $this->getInput('mode');
+        }
+        return $uri;
+    }
 
-		$content = json_decode(html_entity_decode($matches[0][1]), true);
-		$count = 0;
-		foreach($content as $result) {
-			if($count == 10) break;
-			$count++;
+    private function getSearchURI($mode)
+    {
+        switch ($this->queriedContext) {
+            case 'Tag':
+                $query = urlencode($this->getInput('tag'));
+                $uri = static::URI . 'ajax/search/top/' . $query;
+                break;
+            case 'User':
+                $uri = static::URI . 'ajax/user/' . $this->getInput('userid')
+                    . '/profile/top';
+                break;
+            default:
+                returnClientError('Invalid Context');
+        }
+        return $uri;
+    }
 
-			$item = array();
-			$item['id'] = $result['illustId'];
-			$item['uri'] = 'https://www.pixiv.net/member_illust.php?mode=medium&illust_id=' . $result['illustId'];
-			$item['title'] = $result['illustTitle'];
-			$item['author'] = $result['userName'];
+    private function getDataFromJSON($json, $json_key)
+    {
+        $key = $json_key;
+        if (
+            $this->queriedContext === 'Tag' &&
+            $this->getOption('cookie') !== null
+        ) {
+            switch ($json_key) {
+                case 'illust':
+                case 'manga':
+                    $key = 'illustManga';
+                    break;
+            }
+        }
+        $json = $json['body'][$key];
+        // Tags context contains subkey
+        if ($this->queriedContext === 'Tag') {
+            $json = $json['data'];
+            if ($this->getOption('cookie') !== null) {
+                switch ($json_key) {
+                    case 'illust':
+                        $json = array_reduce($json, function ($acc, $i) {
+                            if ($i['illustType'] === 0) {
+                                $acc[] = $i;
+                            }
+                            return $acc;
+                        }, []);
+                        break;
+                    case 'manga':
+                        $json = array_reduce($json, function ($acc, $i) {
+                            if ($i['illustType'] === 1) {
+                                $acc[] = $i;
+                            }return $acc;
+                        }, []);
+                        break;
+                }
+            }
+        }
+        return $json;
+    }
 
-			preg_match_all($timeRegex, $result['url'], $dt, PREG_SET_ORDER, 0);
-			$elementDate = DateTime::createFromFormat('YmdHis',
-						$dt[0][1] . $dt[0][2] . $dt[0][3] . $dt[0][4] . $dt[0][5] . $dt[0][6],
-						new DateTimeZone('Asia/Tokyo'));
-			$item['timestamp'] = $elementDate->getTimestamp();
+    private function collectWorksArray()
+    {
+        $content = $this->getData($this->getSearchURI($this->getInput('mode')), true, true);
+        if ($this->getInput('mode') == 'all') {
+            $total = [];
+            foreach (self::JSON_KEY_MAP[$this->queriedContext] as $mode => $json_key) {
+                $current = $this->getDataFromJSON($content, $json_key);
+                $total = array_merge($total, $current);
+            }
+            $content = $total;
+        } else {
+            $json_key = self::JSON_KEY_MAP[$this->queriedContext][$this->getInput('mode')];
+            $content = $this->getDataFromJSON($content, $json_key);
+        }
+        return $content;
+    }
 
-			$item['content'] = "<img src='" . $this->cacheImage($result['url'], $item['id']) . "' />";
-			$this->items[] = $item;
-		}
-	}
+    public function collectData()
+    {
+        $this->checkOptions();
+        $proxy_url = $this->getOption('proxy_url');
+        $proxy_url = $proxy_url ? rtrim($proxy_url, '/') : null;
 
-	private function cacheImage($url, $illustId) {
+        $content = $this->collectWorksArray();
+        $content = array_filter($content, function ($v, $k) {
+            return !array_key_exists('isAdContainer', $v);
+        }, ARRAY_FILTER_USE_BOTH);
 
-		$url = str_replace('_master1200', '', $url);
-		$url = str_replace('c/240x240/img-master/', 'img-original/', $url);
-		$path = PATH_CACHE . 'pixiv_img/';
+        // Sort by updateDate to get newest works
+        usort($content, function ($a, $b) {
+            return $b['updateDate'] <=> $a['updateDate'];
+        });
 
-		if(!is_dir($path))
-			mkdir($path, 0755, true);
+        //exclude AI generated works if unchecked.
+        if ($this->getInput('ai') !== true) {
+            $content = array_filter($content, function ($v) {
+                $isAI = $v['aiType'] === 2;
+                return !$isAI;
+            });
+        }
 
-		if(!is_file($path . '/' . $illustId . '.jpeg')) {
-			$headers = array('Referer:  https://www.pixiv.net/member_illust.php?mode=medium&illust_id=' . $illustId);
-			$illust = getContents($url, $headers);
-			if(strpos($illust, '404 Not Found') !== false) {
-				$illust = getContents(str_replace('jpg', 'png', $url), $headers);
-			}
-			file_put_contents($path . '/' . $illustId . '.jpeg', $illust);
-		}
+        //exclude R-18 works if unchecked.
+        if ($this->getInput('mature') !== true) {
+            $content = array_filter($content, function ($v) {
+                $isMature = $v['xRestrict'] > 0;
+                return !$isMature;
+            });
+        }
 
-		return 'cache/pixiv_img/' . $illustId . '.jpeg';
+        $content = array_slice($content, 0, $this->getInput('posts'));
 
-	}
+        foreach ($content as $result) {
+            // Store username for getName()
+            if (!$this->username) {
+                $this->username = $result['userName'];
+            }
+
+            $item = [];
+            $item['uid'] = $result['id'];
+
+            $subpath = array_key_exists('illustType', $result) ? 'artworks/' : 'novel/show.php?id=';
+            $item['uri'] = static::URI . $subpath . $result['id'];
+
+            $item['title'] = $result['title'];
+            $item['author'] = $result['userName'];
+            $item['timestamp'] = $result['updateDate'];
+            $item['categories'] = $result['tags'];
+
+            if ($proxy_url) {
+                //use proxy image host if set.
+                if ($this->getInput('fullsize')) {
+                    $ajax_uri = static::URI . 'ajax/illust/' . $result['id'];
+                    $imagejson = $this->getData($ajax_uri, true, true);
+                    $img_url = preg_replace('/https:\/\/i\.pximg\.net/', $proxy_url, $imagejson['body']['urls']['original']);
+                } else {
+                    $img_url = preg_replace('/https:\/\/i\.pximg\.net/', $proxy_url, $result['url']);
+                }
+            } else {
+                $img_url = $result['url'];
+            }
+
+            // Currently, this might result in broken image due to their strict referrer check
+            $item['content'] = sprintf('<a href="%s"><img src="%s"/></a>', $img_url, $img_url);
+
+            // Additional content items
+            if (array_key_exists('pageCount', $result)) {
+                $item['content'] .= '<br>Page Count: ' . $result['pageCount'];
+            } else {
+                $item['content'] .= '<br>Word Count: ' . $result['wordCount'];
+            }
+
+            $this->items[] = $item;
+        }
+    }
+
+    private function checkOptions()
+    {
+        $proxy = $this->getOption('proxy_url');
+        if ($proxy) {
+            if (
+                !(strlen($proxy) > 0 && preg_match('/https?:\/\/.*/', $proxy))
+            ) {
+                returnServerError('Invalid proxy_url value set. The proxy must include the HTTP/S at the beginning of the url.');
+            }
+        }
+
+        $cookie = $this->getCookie();
+        if ($cookie) {
+            $isAuth = $this->loadCacheValue('is_authenticated');
+            if (!$isAuth) {
+                $res = $this->getData('https://www.pixiv.net/ajax/webpush', true, true);
+                if ($res['error'] === false) {
+                    $this->saveCacheValue('is_authenticated', true);
+                }
+            }
+        }
+    }
+
+    private function checkCookie(array $headers)
+    {
+        if (array_key_exists('set-cookie', $headers)) {
+            foreach ($headers['set-cookie'] as $value) {
+                if (str_starts_with($value, 'PHPSESSID=')) {
+                    parse_str(strtr($value, ['&' => '%26', '+' => '%2B', ';' => '&']), $cookie);
+                    if ($cookie['PHPSESSID'] != $this->getCookie()) {
+                        $this->saveCacheValue('cookie', $cookie['PHPSESSID']);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private function getCookie()
+    {
+        // checks if cookie is set, if not initialise it with the cookie from the config
+        $value = $this->loadCacheValue('cookie');
+        if (!isset($value)) {
+            $value = $this->getOption('cookie');
+
+            // 30 days + 1 day to let cookie chance to renew
+            $this->saveCacheValue('cookie', $this->getOption('cookie'), 2678400);
+        }
+        return $value;
+    }
+
+    //Cache getContents by default
+    private function getData(string $url, bool $cache = true, bool $getJSON = false, array $httpHeaders = [], array $curlOptions = [])
+    {
+        $cookie_str = $this->getCookie();
+        if ($cookie_str) {
+            $curlOptions[CURLOPT_COOKIE] = 'PHPSESSID=' . $cookie_str;
+        }
+
+        if ($cache) {
+            $data = $this->loadCacheValue($url);
+            if (!$data) {
+                $data = getContents($url, $httpHeaders, $curlOptions, true);
+                $this->saveCacheValue($url, $data);
+            }
+        } else {
+            $data = getContents($url, $httpHeaders, $curlOptions, true);
+        }
+
+        $this->checkCookie($data['headers']);
+
+        if ($getJSON) {
+            return json_decode($data['content'], true);
+        } else {
+            return $data['content'];
+        }
+    }
 }

@@ -1,53 +1,45 @@
 <?php
-/**
- * This file is part of RSS-Bridge, a PHP project capable of generating RSS and
- * Atom feeds for websites that don't have one.
- *
- * For the full license information, please view the UNLICENSE file distributed
- * with this source code.
- *
- * @package	Core
- * @license	http://unlicense.org/ UNLICENSE
- * @link	https://github.com/rss-bridge/rss-bridge
- */
 
-class DetectAction extends ActionAbstract {
-	public function execute() {
-		$targetURL = $this->userData['url']
-			or returnClientError('You must specify a url!');
+class DetectAction implements ActionInterface
+{
+    public function execute(Request $request)
+    {
+        $url = $request->get('url');
+        $format = $request->get('format');
 
-		$format = $this->userData['format']
-			or returnClientError('You must specify a format!');
+        if (!$url) {
+            return new Response(render(__DIR__ . '/../templates/error.html.php', ['message' => 'You must specify a url']));
+        }
+        if (!$format) {
+            return new Response(render(__DIR__ . '/../templates/error.html.php', ['message' => 'You must specify a format']));
+        }
 
-		$bridgeFac = new \BridgeFactory();
-		$bridgeFac->setWorkingDir(PATH_LIB_BRIDGES);
+        $bridgeFactory = new BridgeFactory();
 
-		foreach($bridgeFac->getBridgeNames() as $bridgeName) {
+        foreach ($bridgeFactory->getBridgeClassNames() as $bridgeClassName) {
+            if (!$bridgeFactory->isEnabled($bridgeClassName)) {
+                continue;
+            }
 
-			if(!$bridgeFac->isWhitelisted($bridgeName)) {
-				continue;
-			}
+            $bridge = $bridgeFactory->create($bridgeClassName);
 
-			$bridge = $bridgeFac->create($bridgeName);
+            $bridgeParams = $bridge->detectParameters($url);
 
-			if($bridge === false) {
-				continue;
-			}
+            if (!$bridgeParams) {
+                continue;
+            }
 
-			$bridgeParams = $bridge->detectParameters($targetURL);
+            $query = [
+                'action' => 'display',
+                'bridge' => $bridgeClassName,
+                'format' => $format,
+            ];
+            $query = array_merge($query, $bridgeParams);
+            return new Response('', 301, ['location' => '?' . http_build_query($query)]);
+        }
 
-			if(is_null($bridgeParams)) {
-				continue;
-			}
-
-			$bridgeParams['bridge'] = $bridgeName;
-			$bridgeParams['format'] = $format;
-
-			header('Location: ?action=display&' . http_build_query($bridgeParams), true, 301);
-			die();
-
-		}
-
-		returnClientError('No bridge found for given URL: ' . $targetURL);
-	}
+        return new Response(render(__DIR__ . '/../templates/error.html.php', [
+            'message' => 'No bridge found for given URL: ' . $url,
+        ]));
+    }
 }
